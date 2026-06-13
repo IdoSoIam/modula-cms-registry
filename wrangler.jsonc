@@ -1,0 +1,24 @@
+{
+  "name": "modula-cms-registery",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-06-02",
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "modula-cms-registery",
+      "database_id": "abafb83b-80e0-45da-8181-9584f1c4a878",
+      "remote": true
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "ASSETS",
+      "bucket_name": "modula-cms-registery-assets",
+      "remote": true
+    }
+  ],
+  "vars": {
+    "API_KEYS_JSON": "{\"local-dev\":\"local-dev-secret\"}",
+    "OWNER_API_KEY": "fNaOYWeJhdUa9tM0ENZz"
+  }
+}

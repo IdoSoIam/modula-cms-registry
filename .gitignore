@@ -1,0 +1,5 @@
+.wrangler/state/
+.wrangler/tmp/
+
+node_modules/
+.env

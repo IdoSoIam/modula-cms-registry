@@ -1,0 +1,17 @@
+{
+  "name": "modula-cms-registery",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev --local --config ./wrangler.jsonc --cwd . --persist-to ./.wrangler/state",
+    "dev:remote": "wrangler dev --config ./wrangler.jsonc --cwd . --persist-to ./.wrangler/state",
+    "deploy": "wrangler deploy --config ./wrangler.jsonc --cwd .",
+    "db:migrate:remote": "wrangler d1 migrations apply DB --remote --config ./wrangler.jsonc --cwd .",
+    "db:migrate:local": "wrangler d1 migrations apply DB --local --config ./wrangler.jsonc --cwd . --persist-to ./.wrangler/state"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260530.0",
+    "typescript": "^5.9.3",
+    "wrangler": "^4.95.0"
+  }
+}
