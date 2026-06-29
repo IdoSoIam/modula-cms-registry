@@ -2,11 +2,13 @@ import { handleGmailSyncModule } from "./modules/gmail-sync"
 import { handleInstancesModule } from "./modules/instances"
 import { handlePaymentsModule } from "./modules/payments"
 import { handleTemplatesModule } from "./modules/templates"
+import { handleTranslationsModule } from "./modules/translations"
 import { handleUpdateModule } from "./modules/update"
 
 export interface Env {
   DB: D1Database
   ASSETS: R2Bucket
+  AI: Ai
   PUBLIC_BASE_URL?: string
   OWNER_API_KEY?: string
   CUSTOM_API_KEY?: string
@@ -46,16 +48,14 @@ type RegistryCapabilities = {
 
 type PaymentProvider = 'none' | 'stripe_connect'
 type PaymentStatus = 'UNPAID' | 'PENDING' | 'PAID' | 'FAILED' | 'REFUNDED'
-type PaymentTaxBehavior = 'inclusive' | 'exclusive'
-
 type RegistryPaymentSettings = {
   provider: PaymentProvider
   connectedAccountId: string
   connectedAccountLabel: string
-  automaticTaxEnabled: boolean
-  defaultTaxCode: string
-  defaultTaxBehavior: PaymentTaxBehavior
   commissionPercent: number
+  automaticTaxEnabled: boolean
+  defaultTaxBehavior: 'inclusive' | 'exclusive'
+  defaultTaxCode: string
 }
 
 type RegistryPaymentLineItem = {
@@ -65,7 +65,7 @@ type RegistryPaymentLineItem = {
   currency?: string
   description?: string
   imageUrl?: string
-  taxBehavior?: PaymentTaxBehavior
+  taxBehavior?: 'inclusive' | 'exclusive'
   taxCode?: string
 }
 
@@ -95,6 +95,24 @@ type RegistryPaymentRecord = {
   updatedAt: string
 }
 
+type TranslationInput = {
+  text: string
+  sourceLocale: string
+  targetLocale: string
+}
+
+type TranslationBatchRequest = {
+  items: TranslationInput[]
+}
+
+type TranslationBatchItemResult = {
+  sourceLocale: string
+  targetLocale: string
+  sourceText: string
+  translatedText: string
+  cached: boolean
+}
+
 function json(data: unknown, init: ResponseInit = {}) {
   return new Response(JSON.stringify(data), {
     ...init,
@@ -120,6 +138,12 @@ function nowIso() {
 
 function newId(prefix: string) {
   return `${prefix}_${crypto.randomUUID()}`
+}
+
+async function sha256Hex(value: string) {
+  const bytes = new TextEncoder().encode(value)
+  const digest = await crypto.subtle.digest("SHA-256", bytes)
+  return Array.from(new Uint8Array(digest)).map((part) => part.toString(16).padStart(2, "0")).join("")
 }
 
 function getOwnerApiKey(env: Env) {
@@ -321,10 +345,6 @@ async function readJson<T>(request: Request) {
   return await request.json() as T
 }
 
-function normalizePaymentTaxBehavior(value: unknown, fallback: PaymentTaxBehavior = 'inclusive'): PaymentTaxBehavior {
-  return value === 'exclusive' ? 'exclusive' : value === 'inclusive' ? 'inclusive' : fallback
-}
-
 function normalizePaymentSettings(value: unknown): RegistryPaymentSettings {
   const input = typeof value === 'object' && value ? value as Partial<RegistryPaymentSettings> : {}
   const commission = Number(input.commissionPercent)
@@ -339,10 +359,10 @@ function normalizePaymentSettings(value: unknown): RegistryPaymentSettings {
     provider: input.provider === 'stripe_connect' ? 'stripe_connect' : 'none',
     connectedAccountId: typeof input.connectedAccountId === 'string' ? input.connectedAccountId.trim() : '',
     connectedAccountLabel: typeof input.connectedAccountLabel === 'string' ? input.connectedAccountLabel.trim() : '',
+    commissionPercent: Math.max(0, Math.min(100, Math.round(resolvedCommission * 100) / 100)),
     automaticTaxEnabled: Boolean(input.automaticTaxEnabled),
-    defaultTaxCode: typeof input.defaultTaxCode === 'string' ? input.defaultTaxCode.trim() : '',
-    defaultTaxBehavior: normalizePaymentTaxBehavior(input.defaultTaxBehavior, 'inclusive'),
-    commissionPercent: Math.max(0, Math.min(100, Math.round(resolvedCommission * 100) / 100))
+    defaultTaxBehavior: input.defaultTaxBehavior === 'exclusive' ? 'exclusive' : 'inclusive',
+    defaultTaxCode: typeof input.defaultTaxCode === 'string' ? input.defaultTaxCode.trim() : ''
   }
 }
 
@@ -356,10 +376,10 @@ function getDefaultPaymentSettings(env: Env): RegistryPaymentSettings {
     provider: env.STRIPE_SECRET_KEY?.trim() ? 'stripe_connect' : 'none',
     connectedAccountId: '',
     connectedAccountLabel: '',
-    automaticTaxEnabled: true,
-    defaultTaxCode: '',
+    commissionPercent: getDefaultCommissionPercent(env),
+    automaticTaxEnabled: false,
     defaultTaxBehavior: 'inclusive',
-    commissionPercent: getDefaultCommissionPercent(env)
+    defaultTaxCode: ''
   }
 }
 
@@ -418,6 +438,26 @@ async function stripeRequest<T>(env: Env, path: string, params: URLSearchParams)
     method: 'POST',
     headers: getStripeHeaders(env),
     body: params.toString()
+  })
+
+  const payload = await response.json<any>()
+  if (!response.ok) {
+    throw json({
+      message: payload?.error?.message || 'Stripe request failed.',
+      stripeError: payload?.error || null
+    }, { status: response.status })
+  }
+
+  return payload as T
+}
+
+async function stripeGet<T>(env: Env, path: string, params?: URLSearchParams) {
+  const query = params?.toString()
+  const response = await fetch(`https://api.stripe.com${path}${query ? `?${query}` : ''}`, {
+    method: 'GET',
+    headers: {
+      authorization: `Bearer ${env.STRIPE_SECRET_KEY?.trim() || ''}`
+    }
   })
 
   const payload = await response.json<any>()
@@ -504,10 +544,10 @@ function decorateInstance(row: any, env: Env) {
       configured: paymentSettings.provider === 'stripe_connect' && Boolean(paymentSettings.connectedAccountId) && isStripeConfigured(env),
       connectedAccountId: paymentSettings.connectedAccountId,
       connectedAccountLabel: paymentSettings.connectedAccountLabel,
-      automaticTaxEnabled: paymentSettings.automaticTaxEnabled,
-      defaultTaxCode: paymentSettings.defaultTaxCode,
-      defaultTaxBehavior: paymentSettings.defaultTaxBehavior,
       commissionPercent: paymentSettings.commissionPercent,
+      automaticTaxEnabled: paymentSettings.automaticTaxEnabled,
+      defaultTaxBehavior: paymentSettings.defaultTaxBehavior,
+      defaultTaxCode: paymentSettings.defaultTaxCode,
       publishableKey: env.STRIPE_PUBLISHABLE_KEY?.trim() || ''
     }
   }
@@ -1178,6 +1218,7 @@ async function createStripeConnectCheckout(request: Request, env: Env) {
     successUrl: string
     cancelUrl: string
     customerEmail?: string
+    locale?: string
     currency?: string
     metadata?: Record<string, string>
     lineItems?: RegistryPaymentLineItem[]
@@ -1196,8 +1237,18 @@ async function createStripeConnectCheckout(request: Request, env: Env) {
   const amountTotal = lineItems.reduce((sum, item) => sum + normalizeIntegerAmount(item.amount) * Math.max(1, Math.round(Number(item.quantity || 1))), 0)
   const commissionPercent = paymentSettings.commissionPercent
   const commissionAmount = Math.max(0, Math.round(amountTotal * (commissionPercent / 100)))
+  const SUPPORTED_STRIPE_LOCALES = new Set([
+    'da', 'de', 'en', 'es', 'fi', 'fr', 'it', 'ja', 'ko',
+    'ms', 'nb', 'nl', 'pt', 'sv', 'th', 'zh', 'zh-hk', 'zh-tw'
+  ])
+  const locale = (body.locale || '').trim().toLowerCase()
+  const stripeLocale = SUPPORTED_STRIPE_LOCALES.has(locale) ? locale : ''
+
   const params = new URLSearchParams()
   appendStripeParam(params, 'mode', 'payment')
+  if (stripeLocale) {
+    appendStripeParam(params, 'locale', stripeLocale)
+  }
   appendStripeParam(params, 'success_url', body.successUrl.trim())
   appendStripeParam(params, 'cancel_url', body.cancelUrl.trim())
   appendStripeParam(params, 'customer_email', body.customerEmail?.trim() || '')
@@ -1209,12 +1260,20 @@ async function createStripeConnectCheckout(request: Request, env: Env) {
   if (paymentSettings.automaticTaxEnabled) {
     appendStripeParam(params, 'automatic_tax[enabled]', 'true')
   }
-
   Object.entries(body.metadata || {}).forEach(([key, value]) => appendStripeParam(params, `metadata[${key}]`, value))
 
-  lineItems.forEach((item, index) => {
+  for (const [index, item] of lineItems.entries()) {
     const quantity = Math.max(1, Math.round(Number(item.quantity || 1)))
     const imageUrl = sanitizeExternalImageUrl(item.imageUrl)
+    const resolvedTaxBehavior = item.taxBehavior === 'exclusive' ? 'exclusive' : item.taxBehavior === 'inclusive' ? 'inclusive' : paymentSettings.defaultTaxBehavior
+    const resolvedTaxCode = typeof item.taxCode === 'string' && item.taxCode.trim()
+      ? item.taxCode.trim()
+      : paymentSettings.defaultTaxCode
+    if (paymentSettings.automaticTaxEnabled && !resolvedTaxCode) {
+      return json({
+        message: 'Stripe Tax est activé mais aucun code taxe n’est défini pour une ligne. Renseignez un code global ou un code par produit/lot.'
+      }, { status: 400 })
+    }
     appendStripeParam(params, `line_items[${index}][quantity]`, quantity)
     appendStripeParam(params, `line_items[${index}][price_data][currency]`, currency)
     appendStripeParam(params, `line_items[${index}][price_data][unit_amount]`, normalizeIntegerAmount(item.amount))
@@ -1222,18 +1281,18 @@ async function createStripeConnectCheckout(request: Request, env: Env) {
       appendStripeParam(
         params,
         `line_items[${index}][price_data][tax_behavior]`,
-        normalizePaymentTaxBehavior(item.taxBehavior, paymentSettings.defaultTaxBehavior)
+        resolvedTaxBehavior
       )
       appendStripeParam(
         params,
         `line_items[${index}][price_data][product_data][tax_code]`,
-        typeof item.taxCode === 'string' && item.taxCode.trim() ? item.taxCode.trim() : paymentSettings.defaultTaxCode
+        resolvedTaxCode
       )
     }
     appendStripeParam(params, `line_items[${index}][price_data][product_data][name]`, item.name)
     appendStripeParam(params, `line_items[${index}][price_data][product_data][description]`, item.description || '')
     appendStripeParam(params, `line_items[${index}][price_data][product_data][images][0]`, imageUrl)
-  })
+  }
 
   const stripeSession = await stripeRequest<any>(env, '/v1/checkout/sessions', params)
   const payment = await persistPaymentRecord(env, {
@@ -1265,8 +1324,35 @@ async function createStripeConnectCheckout(request: Request, env: Env) {
 
 async function getPaymentStatusBySession(request: Request, env: Env, sessionId: string) {
   await authorize(request, env)
-  const payment = await getPaymentBySession(env, sessionId)
+  let payment = await getPaymentBySession(env, sessionId)
   if (!payment) return json({ message: 'Payment session not found.' }, { status: 404 })
+
+  if (isStripeConfigured(env) && payment.providerSessionId) {
+    const stripeSession = await stripeGet<any>(env, `/v1/checkout/sessions/${encodeURIComponent(payment.providerSessionId)}`)
+    payment = await persistPaymentRecord(env, {
+      ...payment,
+      id: payment.id,
+      instanceSlug: payment.instanceSlug,
+      orderId: payment.orderId,
+      provider: payment.provider,
+      providerSessionId: payment.providerSessionId,
+      providerPaymentIntentId: typeof stripeSession.payment_intent === 'string'
+        ? stripeSession.payment_intent
+        : payment.providerPaymentIntentId,
+      providerPaymentStatus: stripeSession.payment_status || payment.providerPaymentStatus,
+      paymentStatus: stripeSession.payment_status === 'paid'
+        ? 'PAID'
+        : stripeSession.status === 'expired'
+          ? 'FAILED'
+          : payment.paymentStatus,
+      checkoutUrl: stripeSession.url || payment.checkoutUrl,
+      metadata: {
+        ...payment.metadata,
+        stripeCheckoutStatus: stripeSession.status || null
+      }
+    })
+  }
+
   return json(payment)
 }
 
@@ -1629,16 +1715,56 @@ function renderAdminAppPage() {
           </form>
         </section>
       </div>
+      <div class="grid">
+        <section class="panel">
+          <div style="display:flex;justify-content:space-between;gap:1rem;align-items:end;">
+            <div>
+              <h2>Instances</h2>
+              <div class="meta">Configurer Stripe Connect et la commission par instance.</div>
+            </div>
+            <button class="secondary" id="refresh-instances" type="button">Rafraîchir</button>
+          </div>
+          <div id="instances-list" class="list" style="margin-top:1rem;"></div>
+        </section>
+        <section class="panel">
+          <h2>Éditer une instance</h2>
+          <div id="instance-status" class="status" style="margin-top:.5rem;"></div>
+          <form id="instance-form" style="margin-top:1rem;">
+            <div class="row">
+              <label>Slug<input name="slug" readonly /></label>
+              <label>Nom<input name="name" readonly /></label>
+            </div>
+            <div class="row" style="margin-top:.9rem;">
+              <label>Environnement<input name="environment" readonly /></label>
+              <label>Canal<input name="releaseChannel" readonly /></label>
+            </div>
+            <div class="row" style="margin-top:.9rem;">
+              <label>Provider
+                <input name="provider" placeholder="stripe_connect ou none" />
+              </label>
+              <label>Commission (%)<input name="commissionPercent" type="number" min="0" max="100" step="0.01" /></label>
+            </div>
+            <div class="row" style="margin-top:.9rem;">
+              <label>Compte connecté Stripe<input name="connectedAccountId" placeholder="acct_..." /></label>
+              <label>Libellé compte<input name="connectedAccountLabel" placeholder="Nom de l'instance ou du marchand" /></label>
+            </div>
+            <div class="actions"><button type="submit">Enregistrer l’instance</button></div>
+          </form>
+        </section>
+      </div>
     </main>
     <script>
-      const state = { templates: [], releases: [], selectedTemplateSlug: '', selectedReleaseVersion: '' }
+      const state = { templates: [], releases: [], instances: [], selectedTemplateSlug: '', selectedReleaseVersion: '', selectedInstanceSlug: '' }
       const $ = (selector) => document.querySelector(selector)
       const templatesList = $('#templates-list')
       const releasesList = $('#releases-list')
+      const instancesList = $('#instances-list')
       const templateForm = $('#template-form')
       const releaseForm = $('#release-form')
+      const instanceForm = $('#instance-form')
       const templateStatus = $('#template-status')
       const releaseStatus = $('#release-status')
+      const instanceStatus = $('#instance-status')
 
       function text(value) { return value == null ? '' : String(value) }
       function localized(value) { return text(value?.fr || value?.en || '') }
@@ -1683,6 +1809,17 @@ function renderAdminAppPage() {
         })
       }
 
+      function renderInstances() {
+        instancesList.innerHTML = state.instances.map((instance) => '<button type="button" class="item ' + (state.selectedInstanceSlug === instance.slug ? 'active' : '') + '" data-instance-slug="' + instance.slug + '"><div style="display:flex;justify-content:space-between;gap:1rem;align-items:start;"><div><strong style="color: black;">' + text(instance.name || instance.slug) + '</strong><div class="meta">' + instance.slug + ' · ' + text(instance.environment || '') + '</div></div><span class="badge">' + text(instance.payment?.provider || 'none') + '</span></div><div class="meta" style="margin-top:.6rem;">Commission ' + text(instance.payment?.commissionPercent ?? 0) + '% · Compte ' + text(instance.payment?.connectedAccountId || 'non configuré') + '</div></button>').join('')
+        instancesList.querySelectorAll('[data-instance-slug]').forEach((button) => {
+          button.addEventListener('click', () => {
+            state.selectedInstanceSlug = button.getAttribute('data-instance-slug') || ''
+            fillInstanceForm()
+            renderInstances()
+          })
+        })
+      }
+
       function fillTemplateForm() {
         const template = state.templates.find(item => item.slug === state.selectedTemplateSlug)
         if (!template) return
@@ -1709,6 +1846,19 @@ function renderAdminAppPage() {
         releaseForm.changelogMarkdown.value = text(release.changelogMarkdown)
       }
 
+      function fillInstanceForm() {
+        const instance = state.instances.find(item => item.slug === state.selectedInstanceSlug)
+        if (!instance) return
+        instanceForm.slug.value = text(instance.slug)
+        instanceForm.name.value = text(instance.name)
+        instanceForm.environment.value = text(instance.environment)
+        instanceForm.releaseChannel.value = text(instance.releaseChannel)
+        instanceForm.provider.value = text(instance.payment?.provider || 'none')
+        instanceForm.commissionPercent.value = text(instance.payment?.commissionPercent ?? 0)
+        instanceForm.connectedAccountId.value = text(instance.payment?.connectedAccountId)
+        instanceForm.connectedAccountLabel.value = text(instance.payment?.connectedAccountLabel)
+      }
+
       async function loadTemplates() {
         templateStatus.textContent = 'Chargement des templates...'
         state.templates = await fetchJson('/admin/api/templates')
@@ -1725,6 +1875,15 @@ function renderAdminAppPage() {
         renderReleases()
         fillReleaseForm()
         releaseStatus.textContent = ''
+      }
+
+      async function loadInstances() {
+        instanceStatus.textContent = 'Chargement des instances...'
+        state.instances = await fetchJson('/admin/api/instances')
+        if (!state.selectedInstanceSlug && state.instances[0]) state.selectedInstanceSlug = state.instances[0].slug
+        renderInstances()
+        fillInstanceForm()
+        instanceStatus.textContent = ''
       }
 
       templateForm.addEventListener('submit', async (event) => {
@@ -1774,12 +1933,36 @@ function renderAdminAppPage() {
         }
       })
 
+      instanceForm.addEventListener('submit', async (event) => {
+        event.preventDefault()
+        const slug = text(instanceForm.slug.value).trim()
+        if (!slug) return
+        instanceStatus.textContent = 'Enregistrement de l’instance...'
+        try {
+          await fetchJson('/admin/api/instances/' + encodeURIComponent(slug) + '/payment', {
+            method: 'PATCH',
+            body: JSON.stringify({
+              provider: text(instanceForm.provider.value).trim() === 'stripe_connect' ? 'stripe_connect' : 'none',
+              commissionPercent: Number(instanceForm.commissionPercent.value || 0),
+              connectedAccountId: instanceForm.connectedAccountId.value,
+              connectedAccountLabel: instanceForm.connectedAccountLabel.value
+            })
+          })
+          await loadInstances()
+          instanceStatus.textContent = 'Instance enregistrée.'
+        } catch (error) {
+          instanceStatus.textContent = error.message || 'Erreur de sauvegarde.'
+        }
+      })
+
       $('#refresh-templates').addEventListener('click', () => loadTemplates().catch((error) => { templateStatus.textContent = error.message || 'Erreur' }))
       $('#refresh-releases').addEventListener('click', () => loadReleases().catch((error) => { releaseStatus.textContent = error.message || 'Erreur' }))
+      $('#refresh-instances').addEventListener('click', () => loadInstances().catch((error) => { instanceStatus.textContent = error.message || 'Erreur' }))
 
-      Promise.all([loadTemplates(), loadReleases()]).catch((error) => {
+      Promise.all([loadTemplates(), loadReleases(), loadInstances()]).catch((error) => {
         templateStatus.textContent = error.message || 'Erreur'
         releaseStatus.textContent = error.message || 'Erreur'
+        instanceStatus.textContent = error.message || 'Erreur'
       })
     </script>
   </body>
@@ -1821,6 +2004,36 @@ async function adminListReleases(request: Request, env: Env) {
   return json(result.results.map(row => decorateRelease(request, env, row)))
 }
 
+async function adminListInstances(request: Request, env: Env) {
+  requireOwnerSession(request, env)
+  const result = await env.DB.prepare('SELECT * FROM instances ORDER BY updated_at DESC').all<any>()
+  return json(result.results.map(row => decorateInstance(row, env)))
+}
+
+async function adminUpdateInstancePayment(request: Request, env: Env, slug: string) {
+  requireOwnerSession(request, env)
+  const row = await env.DB.prepare('SELECT * FROM instances WHERE slug = ?').bind(slug).first<any>()
+  if (!row) return json({ message: 'Instance not found' }, { status: 404 })
+
+  const body = await readJson<any>(request)
+  const mergedSettings = normalizePaymentSettings({
+    ...parseInstancePaymentSettings(row, env),
+    ...(body || {})
+  })
+
+  await env.DB.prepare(
+    'UPDATE instances SET payment_provider = ?, payment_settings_json = ?, updated_at = ? WHERE slug = ?'
+  ).bind(
+    mergedSettings.provider,
+    JSON.stringify(mergedSettings),
+    nowIso(),
+    slug
+  ).run()
+
+  const updated = await env.DB.prepare('SELECT * FROM instances WHERE slug = ?').bind(slug).first<any>()
+  return json(decorateInstance(updated, env))
+}
+
 async function adminUpdateReleaseMeta(request: Request, env: Env, version: string) {
   requireOwnerSession(request, env)
   const body = await readJson<ReleaseRegistryMeta>(request)
@@ -1840,6 +2053,180 @@ async function adminUpdateReleaseMeta(request: Request, env: Env, version: strin
   await env.DB.prepare('UPDATE releases SET manifest_json = ? WHERE version = ?').bind(JSON.stringify(manifest), version).run()
   const updated = await env.DB.prepare('SELECT * FROM releases WHERE version = ?').bind(version).first<any>()
   return json(decorateRelease(request, env, updated))
+}
+
+function normalizeTranslationLocale(value: unknown) {
+  return String(value || '').trim().toLowerCase()
+}
+
+function normalizeTranslationText(value: unknown) {
+  return typeof value === 'string' ? value.trim() : ''
+}
+
+async function getCachedTranslation(
+  env: Env,
+  sourceLocale: string,
+  targetLocale: string,
+  sourceText: string
+) {
+  const sourceHash = await sha256Hex(`${sourceLocale}:${targetLocale}:${sourceText}`)
+  const row = await env.DB.prepare(
+    `SELECT id, translated_text, provider
+     FROM translation_cache
+     WHERE source_locale = ? AND target_locale = ? AND source_hash = ?
+     LIMIT 1`
+  ).bind(sourceLocale, targetLocale, sourceHash).first<any>()
+
+  if (!row?.translated_text) {
+    return null
+  }
+
+  return {
+    id: String(row.id),
+    translatedText: String(row.translated_text),
+    provider: String(row.provider || 'workers_ai'),
+    sourceHash
+  }
+}
+
+async function saveTranslationCache(
+  env: Env,
+  sourceLocale: string,
+  targetLocale: string,
+  sourceText: string,
+  translatedText: string
+) {
+  const sourceHash = await sha256Hex(`${sourceLocale}:${targetLocale}:${sourceText}`)
+  const now = nowIso()
+  const existing = await env.DB.prepare(
+    'SELECT id FROM translation_cache WHERE source_locale = ? AND target_locale = ? AND source_hash = ? LIMIT 1'
+  ).bind(sourceLocale, targetLocale, sourceHash).first<any>()
+
+  if (existing?.id) {
+    await env.DB.prepare(
+      `UPDATE translation_cache
+       SET translated_text = ?, provider = 'workers_ai', updated_at = ?
+       WHERE id = ?`
+    ).bind(
+      translatedText,
+      now,
+      existing.id
+    ).run()
+    return existing.id as string
+  }
+
+  const id = newId('tr')
+  await env.DB.prepare(
+    `INSERT INTO translation_cache
+     (id, source_locale, target_locale, source_text, source_hash, translated_text, provider, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, 'workers_ai', ?, ?)`
+  ).bind(
+    id,
+    sourceLocale,
+    targetLocale,
+    sourceText,
+    sourceHash,
+    translatedText,
+    now,
+    now
+  ).run()
+
+  return id
+}
+
+async function translateWithWorkersAI(env: Env, sourceText: string, sourceLocale: string, targetLocale: string) {
+  const response = await env.AI.run("@cf/meta/m2m100-1.2b", {
+    text: sourceText,
+    source_lang: sourceLocale,
+    target_lang: targetLocale
+  }) as any
+
+  if (typeof response === 'string') {
+    return response.trim()
+  }
+
+  if (Array.isArray(response?.result) && response.result[0]?.translated_text) {
+    return String(response.result[0].translated_text).trim()
+  }
+
+  if (typeof response?.translated_text === 'string') {
+    return response.translated_text.trim()
+  }
+
+  if (typeof response?.translation === 'string') {
+    return response.translation.trim()
+  }
+
+  throw new Error('Workers AI returned an unexpected translation payload.')
+}
+
+async function translateText(request: Request, env: Env) {
+  const body = await readJson<TranslationBatchRequest>(request)
+  const items = Array.isArray(body?.items) ? body.items : []
+
+  if (!items.length) {
+    return json({ items: [], translated: 0, cached: 0 })
+  }
+
+  const results: TranslationBatchItemResult[] = []
+  let translated = 0
+  let cached = 0
+
+  for (const item of items) {
+    const sourceLocale = normalizeTranslationLocale(item?.sourceLocale)
+    const targetLocale = normalizeTranslationLocale(item?.targetLocale)
+    const sourceText = normalizeTranslationText(item?.text)
+
+    if (!sourceLocale || !targetLocale || !sourceText) {
+      continue
+    }
+
+    if (sourceLocale === targetLocale) {
+      results.push({
+        sourceLocale,
+        targetLocale,
+        sourceText,
+        translatedText: sourceText,
+        cached: true
+      })
+      cached += 1
+      continue
+    }
+
+    const cacheHit = await getCachedTranslation(env, sourceLocale, targetLocale, sourceText)
+    if (cacheHit?.translatedText) {
+      results.push({
+        sourceLocale,
+        targetLocale,
+        sourceText,
+        translatedText: cacheHit.translatedText,
+        cached: true
+      })
+      cached += 1
+      continue
+    }
+
+    const translatedText = await translateWithWorkersAI(env, sourceText, sourceLocale, targetLocale)
+    if (!translatedText) {
+      continue
+    }
+
+    await saveTranslationCache(env, sourceLocale, targetLocale, sourceText, translatedText)
+    results.push({
+      sourceLocale,
+      targetLocale,
+      sourceText,
+      translatedText,
+      cached: false
+    })
+    translated += 1
+  }
+
+  return json({
+    items: results,
+    translated,
+    cached
+  })
 }
 
 export default {
@@ -1873,6 +2260,15 @@ export default {
             'set-cookie': 'modula_registry_owner_session=; HttpOnly; Path=/; SameSite=Lax; Secure; Max-Age=0'
           }
         })
+      }
+
+      if (url.pathname === '/admin/api/instances' && request.method === 'GET') {
+        return await adminListInstances(request, env)
+      }
+
+      const adminInstancePaymentMatch = url.pathname.match(/^\/admin\/api\/instances\/([^/]+)\/payment$/)
+      if (adminInstancePaymentMatch && request.method === 'PATCH') {
+        return await adminUpdateInstancePayment(request, env, decodeURIComponent(adminInstancePaymentMatch[1]!))
       }
 
       const templatesResponse = await handleTemplatesModule(
@@ -1936,6 +2332,15 @@ export default {
         }
       )
       if (paymentsResponse) return paymentsResponse
+
+      const translationsResponse = await handleTranslationsModule(
+        { request, url, env },
+        {
+          authorize,
+          translateText
+        }
+      )
+      if (translationsResponse) return translationsResponse
 
       const gmailSyncResponse = await handleGmailSyncModule({ request, url, env })
       if (gmailSyncResponse) return gmailSyncResponse

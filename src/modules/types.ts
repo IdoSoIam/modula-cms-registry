@@ -47,6 +47,11 @@ export type PaymentsModuleHandlers = {
   handleStripeWebhook(request: Request, env: Env): Promise<Response>
 }
 
+export type TranslationsModuleHandlers = {
+  authorize(request: Request, env: Env): Promise<unknown>
+  translateText(request: Request, env: Env): Promise<Response>
+}
+
 export type InstancesModuleHandlers = {
   authorize(request: Request, env: Env): Promise<unknown>
   registerInstance(request: Request, env: Env): Promise<Response>

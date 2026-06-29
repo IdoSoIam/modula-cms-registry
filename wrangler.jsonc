@@ -17,6 +17,9 @@
 			"remote": true
 		}
 	],
+	"ai": {
+		"binding": "AI"
+	},
 	"vars": {
 		"PUBLIC_BASE_URL": "https://modula-cms-registry.shiny-meadow-56d0.workers.dev",
 		"DEFAULT_COMMISSION_PERCENT": "2",
